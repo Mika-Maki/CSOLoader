@@ -501,6 +501,80 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
   }
 #endif /* CSOLOADER_MAKE_LINKER_HOOKS */
 
+/* ---- __cxa_atexit interposition -------------------------------------------
+ * 模块库由 CSOLoader 手工 mmap、卸载时直接 munmap，不走 bionic 的 dlclose。
+ * 若模块的 C++ 静态析构注册进 libc 的 __cxa_atexit 表，卸载后会留下已卸载
+ * DSO 的条目（检测器读成 cleared handler / 空槽）。这里把模块解析到的
+ * __cxa_atexit / __cxa_finalize / atexit 接管到本地表，随库一起消失。
+ */
+struct csoloader_atexit_entry {
+  void (*cxa_func)(void *);
+  void (*plain_func)(void);
+  void *arg;
+  void *dso;
+  struct csoloader_atexit_entry *next;
+};
+
+static struct csoloader_atexit_entry *csoloader_atexit_head;
+
+static int csoloader_cxa_atexit(void (*func)(void *), void *arg, void *dso) {
+  struct csoloader_atexit_entry *entry = malloc(sizeof(*entry));
+  if (!entry) return -1;
+
+  entry->cxa_func = func;
+  entry->plain_func = NULL;
+  entry->arg = arg;
+  entry->dso = dso;
+  entry->next = csoloader_atexit_head;
+  csoloader_atexit_head = entry;
+
+  return 0;
+}
+
+static int csoloader_atexit(void (*func)(void)) {
+  struct csoloader_atexit_entry *entry = malloc(sizeof(*entry));
+  if (!entry) return -1;
+
+  entry->cxa_func = NULL;
+  entry->plain_func = func;
+  entry->arg = NULL;
+  entry->dso = NULL;
+  entry->next = csoloader_atexit_head;
+  csoloader_atexit_head = entry;
+
+  return 0;
+}
+
+static void csoloader_cxa_finalize(void *dso) {
+  struct csoloader_atexit_entry **pp = &csoloader_atexit_head;
+
+  while (*pp) {
+    struct csoloader_atexit_entry *entry = *pp;
+    if (dso == NULL || entry->dso == dso) {
+      if (entry->cxa_func) entry->cxa_func(entry->arg);
+      else if (entry->plain_func) entry->plain_func();
+      *pp = entry->next;
+      free(entry);
+    } else {
+      pp = &entry->next;
+    }
+  }
+}
+
+/* 卸载模块前调用：整表丢掉，不再回调（库即将 munmap）。 */
+void csoloader_drop_atexit_entries(void) {
+  struct csoloader_atexit_entry *entry = csoloader_atexit_head;
+
+  while (entry) {
+    struct csoloader_atexit_entry *next = entry->next;
+    free(entry);
+    entry = next;
+  }
+
+  csoloader_atexit_head = NULL;
+}
+
+
 /* INFO: Internal functions END */
 
 bool linker_init(struct linker *linker, struct csoloader_elf *img) {
@@ -541,8 +615,11 @@ static void _linker_release_dependency(struct linker *linker, int index, bool un
   dep->img = NULL;
   dep->map_size = 0;
 
-  if (unload && dep->is_manual_load && dep_map_size > 0)
+  if (unload && dep->is_manual_load && dep_map_size > 0) {
+    /* 这条依赖即将 munmap，本地 atexit 表里指向它的条目必须一起丢掉，避免之后回调到已卸载地址。 */
+    csoloader_drop_atexit_entries();
     munmap(dep_base, dep_map_size);
+  }
 }
 
 static void _linker_release_dependencies(struct linker *linker, bool unload, bool run_destructors) {
@@ -573,6 +650,8 @@ void linker_destroy(struct linker *linker) {
   _linker_unregister_tls_segment((struct loaded_dep *)linker);
   csoloader_elf_destroy(linker->img);
   linker->img = NULL;
+
+  csoloader_drop_atexit_entries();
 
   if (main_base && main_map_size > 0)
     munmap(main_base, main_map_size);
@@ -1364,6 +1443,22 @@ static bool _linker_process_unified_relocation(struct linker *linker, struct loa
                  library loaded by it calls any of those functions (with the macro defined), it will try
                  to call an address that is no longer valid, resulting in an undefined behavior, which
                  most of the time, in most devices, will result in a segmentation fault. */
+      /* 模块的 C++ 析构注册别落到 bionic 的 atexit 表里，见文件上方说明。 */
+      if (strcmp(sym_name, "__cxa_atexit") == 0) {
+        *target_addr = (ElfW(Addr))csoloader_cxa_atexit;
+        return true;
+      }
+
+      if (strcmp(sym_name, "__cxa_finalize") == 0) {
+        *target_addr = (ElfW(Addr))csoloader_cxa_finalize;
+        return true;
+      }
+
+      if (strcmp(sym_name, "atexit") == 0) {
+        *target_addr = (ElfW(Addr))csoloader_atexit;
+        return true;
+      }
+
       #ifdef CSOLOADER_MAKE_LINKER_HOOKS
         if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
           LOGD("Special case for dl_iterate_phdr: using custom implementation");
